@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>WhatsApp Dashboard</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div>
+        <h1>WhatsApp Dashboard</h1>
+        <p class="sub">OpenWA gateway control</p>
+      </div>
+    </div>
+    <div id="health" class="pill pill-unknown" role="status" aria-live="polite">
+      <span class="dot" aria-hidden="true"></span>
+      <span id="health-text">Checking gateway...</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- Sessions -->
+    <section class="card span-2" id="sessions-panel" aria-labelledby="sessions-title">
+      <div class="card-head">
+        <h2 id="sessions-title">Sessions</h2>
+        <span class="muted small" id="sessions-updated"></span>
+      </div>
+
+      <form id="create-form" class="row" novalidate>
+        <label class="field grow">
+          <span>New session name</span>
+          <input id="session-name" name="name" type="text" placeholder="e.g. sales-team"
+                 minlength="3" maxlength="50" pattern="[A-Za-z0-9-]{3,50}" autocomplete="off" required>
+        </label>
+        <button type="submit" class="btn primary" id="create-btn">Create session</button>
+      </form>
+      <p class="hint">3 to 50 characters: letters, digits and hyphens.</p>
+
+      <div id="sessions-error" class="banner banner-error" role="alert" hidden></div>
+
+      <div class="table-wrap" id="sessions-table-wrap" hidden>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Status</th>
+              <th>Phone</th>
+              <th>Created</th>
+              <th class="actions-col">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-body"></tbody>
+        </table>
+      </div>
+      <p id="sessions-empty" class="empty" hidden>No sessions yet. Create one above to get started.</p>
+    </section>
+
+    <!-- QR code -->
+    <section class="card" id="qr-card" aria-labelledby="qr-title" hidden>
+      <div class="card-head">
+        <h2 id="qr-title">Scan QR code</h2>
+        <button type="button" class="btn small ghost" id="qr-close">Close</button>
+      </div>
+      <p class="muted">
+        On your phone open WhatsApp, go to Linked devices, then scan this code for
+        <strong id="qr-session-name"></strong>.
+      </p>
+      <div class="qr-box">
+        <img id="qr-img" alt="WhatsApp QR code" width="264" height="264" hidden>
+        <p id="qr-status" class="muted small"></p>
+      </div>
+    </section>
+
+    <!-- Send test message -->
+    <section class="card" id="send-panel" aria-labelledby="send-title">
+      <div class="card-head">
+        <h2 id="send-title">Send test message</h2>
+      </div>
+      <form id="send-form" novalidate>
+        <label class="field">
+          <span>Session</span>
+          <select id="send-session" disabled>
+            <option value="">Loading sessions...</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Phone number</span>
+          <input id="send-phone" type="tel" inputmode="numeric" placeholder="919876543210" autocomplete="off" maxlength="20">
+        </label>
+        <p class="hint">International format, digits only, no + or spaces.</p>
+        <label class="field">
+          <span>Message</span>
+          <textarea id="send-text" rows="4" maxlength="4096" placeholder="Hello from the dashboard"></textarea>
+        </label>
+        <p class="hint right" id="send-count">0 / 4096</p>
+        <div class="row">
+          <button type="button" class="btn ghost" id="check-btn" disabled>Check number on WhatsApp</button>
+          <button type="submit" class="btn primary" id="send-btn" disabled>Send message</button>
+        </div>
+      </form>
+      <div id="send-result" class="result" aria-live="polite" hidden></div>
+    </section>
+
+    <!-- ============================================================
+         INBOX PLACEHOLDER
+         Disabled on purpose. Wire this to the webhook receiver later.
+         ============================================================ -->
+    <section class="card disabled" id="inbox-panel" aria-labelledby="inbox-title" aria-disabled="true">
+      <div class="card-head">
+        <h2 id="inbox-title">Inbox</h2>
+        <span class="tag">Disabled</span>
+      </div>
+      <div class="inbox-empty">
+        <p>Coming soon: inbound messages via webhooks</p>
+      </div>
+    </section>
+  </main>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>
