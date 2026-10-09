@@ -1,141 +1,168 @@
 'use strict';
 
-// Minimal client for the AI model. Supports Anthropic (Claude) and any OpenAI-compatible
-// chat completions API (OpenAI, OpenRouter, Groq, Together, a local Ollama, ...).
-const store = require('./db');
+const express = require('express');
+const v = require('../validate');
+const store = require('../db');
+const events = require('../events');
+const ai = require('../ai');
+const llm = require('../llm');
+const media = require('../media');
 
-class AiError extends Error {
-  constructor(message, status) {
-    super(message);
-    this.status = status;
-  }
+const { db } = store;
+const router = express.Router();
+
+function contactOr404(chatId) {
+  const contact = store.getContact(chatId);
+  if (!contact) throw Object.assign(new v.ValidationError('Conversation not found.'), { status: 404 });
+  return contact;
 }
 
-const DEFAULT_BASE = {
-  anthropic: 'https://api.anthropic.com',
-  openai: 'https://api.openai.com/v1',
-  gemini: 'https://generativelanguage.googleapis.com/v1beta/openai', // Gemini's OpenAI-compatible endpoint
-};
+// ---------- AI tab ----------
+router.get('/ai/overview', (req, res) => {
+  res.json(ai.overview());
+});
 
-// The key comes from the AI_API_KEY environment variable, or is saved from the dashboard.
-// It is never sent to the browser.
-function apiKey() {
-  if (process.env.AI_API_KEY) return { key: process.env.AI_API_KEY, source: 'env' };
-  const saved = store.getSetting('aiSecret');
-  if (saved && typeof saved.key === 'string' && saved.key) return { key: saved.key, source: 'dashboard' };
-  return { key: '', source: null };
-}
+// API key: write-only from the browser. The server keeps it; it is never returned.
+router.put('/ai/key', (req, res) => {
+  const key = v.text(req.body?.apiKey, { label: 'API key', max: 400 }).trim();
+  if (/\s/.test(key)) throw new v.ValidationError('The API key must not contain spaces.');
+  store.setSetting('aiSecret', { key });
+  res.json({ ok: true, configured: llm.isConfigured(), keySource: llm.apiKey().source });
+});
 
-function isConfigured() {
+router.delete('/ai/key', (req, res) => {
+  store.setSetting('aiSecret', {});
+  res.json({ ok: true, configured: llm.isConfigured(), keySource: llm.apiKey().source });
+});
+
+// Tries the agent on a sample customer message. Nothing is sent.
+router.post('/ai/test', async (req, res) => {
+  const message = v.text(req.body?.message, { label: 'Test message', max: 1000 });
+  res.json({ decision: await ai.testAgent(message) });
+});
+
+router.post('/ai/digest', async (req, res) => {
+  const hours = v.int(req.body?.hours, { label: 'Hours', min: 1, max: 168, fallback: 24 });
+  res.json({ digest: await ai.digest({ hours }) });
+});
+
+router.post('/ai/write-campaign', async (req, res) => {
+  const goal = v.text(req.body?.goal, { label: 'Goal', max: 600 });
+  const tone = v.optionalText(req.body?.tone, { label: 'Tone', max: 60 });
+  const length = v.optionalText(req.body?.length, { label: 'Length', max: 60 });
+  res.json({ text: await ai.writeCampaign({ goal, tone, length }) });
+});
+
+router.post('/ai/write-snippet', async (req, res) => {
+  const purpose = v.text(req.body?.purpose, { label: 'Purpose', max: 300 });
+  const draft = v.optionalText(req.body?.draft, { label: 'Draft' });
+  res.json({ text: await ai.writeSnippet({ purpose, draft }) });
+});
+
+// ---------- Per chat ----------
+router.get('/ai/chats/:chatId', (req, res) => {
+  const chatId = v.chatId(req.params.chatId);
+  contactOr404(chatId);
   const s = store.getSetting('ai');
-  // A local OpenAI-compatible server (Ollama, LM Studio) can work without a key.
-  return Boolean(apiKey().key || (s.provider === 'openai' && s.baseUrl));
-}
+  res.json({
+    configured: llm.isConfigured(),
+    mode: s.mode,
+    autoSummary: s.autoSummary,
+    summary: ai.cachedSummary(chatId),
+    draft: ai.pendingDraft(chatId),
+  });
+});
 
-/**
- * complete({ system, text, images: [{ mime, data(base64) }], maxTokens, fast })
- * Returns the model's text answer.
- */
-async function complete({ system, text, images = [], maxTokens = 800, fast = false, temperature = 0.4 }) {
-  const s = store.getSetting('ai');
-  const { key } = apiKey();
-  if (!isConfigured()) throw new AiError('AI is not set up yet. Add an API key in the AI tab.', 400);
-  const model = (fast && s.fastModel) || s.model;
-  if (!model) throw new AiError('Choose an AI model in the AI tab.', 400);
-  const base = (s.baseUrl || DEFAULT_BASE[s.provider] || DEFAULT_BASE.openai).replace(/\/+$/, '');
+router.post('/ai/chats/:chatId/summary', async (req, res) => {
+  const chatId = v.chatId(req.params.chatId);
+  res.json({ summary: await ai.summarize(chatId, { force: v.bool(req.body?.force) }) });
+});
 
-  let url;
-  let headers;
-  let body;
-  if (s.provider === 'anthropic') {
-    url = `${base}/v1/messages`;
-    headers = { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' };
-    body = {
-      model,
-      max_tokens: maxTokens,
-      temperature,
-      system,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            ...images.map((img) => ({ type: 'image', source: { type: 'base64', media_type: img.mime, data: img.data } })),
-            { type: 'text', text },
-          ],
-        },
-      ],
-    };
-  } else {
-    url = `${base}/chat/completions`;
-    headers = { 'content-type': 'application/json' };
-    if (key) headers.authorization = `Bearer ${key}`;
-    body = {
-      model,
-      // Gemini models think before answering and that counts against the output budget, so allow more room.
-      max_tokens: s.provider === 'gemini' ? maxTokens + 4000 : maxTokens,
-      temperature,
-      messages: [
-        { role: 'system', content: system },
-        {
-          role: 'user',
-          content: images.length
-            ? [
-                ...images.map((img) => ({ type: 'image_url', image_url: { url: `data:${img.mime};base64,${img.data}` } })),
-                { type: 'text', text },
-              ]
-            : text,
-        },
-      ],
-    };
-    if (s.provider === 'gemini') body.reasoning_effort = 'low'; // fast, cheap answers; enough for chat replies
+router.post('/ai/chats/:chatId/compose', async (req, res) => {
+  const chatId = v.chatId(req.params.chatId);
+  const action = v.oneOf(String(req.body?.action || ''), Object.keys(ai.COMPOSE_TASKS), 'Action');
+  const draft = v.optionalText(req.body?.draft, { label: 'Draft' });
+  res.json({ text: await ai.compose({ chatId, action, draft }) });
+});
+
+router.post('/ai/drafts/:id/approve', async (req, res) => {
+  const id = v.int(req.params.id, { label: 'id', min: 1 });
+  const body = req.body?.body !== undefined ? v.text(req.body.body) : undefined;
+  const sessionId = req.body?.sessionId ? v.uuid(req.body.sessionId, 'session id') : undefined;
+  await ai.approveDraft(id, { body, sessionId });
+  res.json({ ok: true });
+});
+
+router.post('/ai/drafts/:id/discard', (req, res) => {
+  ai.discardDraft(v.int(req.params.id, { label: 'id', min: 1 }));
+  res.json({ ok: true });
+});
+
+// Clear the AI's "needs a person / unhappy / hot" flag once handled.
+router.post('/ai/chats/:chatId/clear-flag', (req, res) => {
+  const chatId = v.chatId(req.params.chatId);
+  contactOr404(chatId);
+  db.prepare('UPDATE contacts SET ai_flag = NULL WHERE chat_id = ?').run(chatId);
+  events.publish('contact', { chatId });
+  events.publish('ai', { chatId });
+  res.json({ contact: store.getContact(chatId) });
+});
+
+// ---------- Media library ----------
+const mapItem = (r) => ({
+  id: r.id,
+  title: r.title,
+  description: r.description,
+  filename: r.filename,
+  mime: r.mime,
+  size: r.size,
+  url: `/api/library/${r.id}/file`,
+  createdAt: r.created_at,
+});
+
+router.get('/library', (req, res) => {
+  res.json({ items: db.prepare('SELECT * FROM library ORDER BY title').all().map(mapItem) });
+});
+
+router.post('/library', (req, res) => {
+  const title = v.text(req.body?.title, { label: 'Title', max: 80 }).trim();
+  const description = v.optionalText(req.body?.description, { label: 'Description', max: 500 }).trim();
+  const buffer = media.decodeBase64(req.body?.data);
+  if (!buffer || !buffer.length) throw new v.ValidationError('Choose a file to upload.');
+  if (buffer.length > media.MAX_MEDIA_BYTES) throw new v.ValidationError(`File is too large (max ${media.MAX_MEDIA_BYTES / 1024 / 1024} MB).`);
+  const mime = media.cleanMime(req.body?.mimetype);
+  const filename = media.safeFilename(v.optionalText(req.body?.filename, { label: 'File name', max: 200 }), mime);
+  const saved = media.saveBuffer(buffer, mime);
+  const info = db
+    .prepare('INSERT INTO library (title, description, path, mime, filename, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(title, description, saved.path, mime, filename, saved.size, store.now());
+  res.status(201).json({ item: mapItem(db.prepare('SELECT * FROM library WHERE id = ?').get(Number(info.lastInsertRowid))) });
+});
+
+router.patch('/library/:id', (req, res) => {
+  const id = v.int(req.params.id, { label: 'id', min: 1 });
+  const row = db.prepare('SELECT * FROM library WHERE id = ?').get(id);
+  if (!row) throw Object.assign(new v.ValidationError('File not found.'), { status: 404 });
+  const title = 'title' in (req.body || {}) ? v.text(req.body.title, { label: 'Title', max: 80 }).trim() : row.title;
+  const description = 'description' in (req.body || {}) ? v.optionalText(req.body.description, { label: 'Description', max: 500 }).trim() : row.description;
+  db.prepare('UPDATE library SET title = ?, description = ? WHERE id = ?').run(title, description, id);
+  res.json({ item: mapItem(db.prepare('SELECT * FROM library WHERE id = ?').get(id)) });
+});
+
+router.delete('/library/:id', (req, res) => {
+  const id = v.int(req.params.id, { label: 'id', min: 1 });
+  const row = db.prepare('SELECT * FROM library WHERE id = ?').get(id);
+  if (row) {
+    db.prepare('DELETE FROM library WHERE id = ?').run(id);
+    media.remove(row.path);
   }
+  res.json({ ok: true });
+});
 
-  let res;
-  try {
-    res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) });
-  } catch (err) {
-    throw new AiError(err.name === 'TimeoutError' ? 'The AI provider took too long to answer.' : 'Cannot reach the AI provider.', 502);
-  }
-  const raw = await res.text();
-  let data = null;
-  try {
-    data = raw ? JSON.parse(raw) : null;
-  } catch {
-    data = null;
-  }
-  if (!res.ok) {
-    const msg = (data && data.error && (data.error.message || data.error)) || `HTTP ${res.status}`;
-    if (res.status === 401 || res.status === 403) throw new AiError('The AI provider rejected the API key.', 502);
-    throw new AiError(`AI provider error: ${String(msg).slice(0, 300)}`, 502);
-  }
+router.get('/library/:id/file', (req, res) => {
+  const row = db.prepare('SELECT * FROM library WHERE id = ?').get(v.int(req.params.id, { label: 'id', min: 1 }));
+  if (!row) return res.status(404).json({ error: 'File not found.' });
+  return media.serve(res, { stored: row.path, mime: row.mime, filename: row.filename });
+});
 
-  let out = '';
-  if (s.provider === 'anthropic') {
-    out = Array.isArray(data?.content) ? data.content.filter((c) => c.type === 'text').map((c) => c.text).join('') : '';
-  } else {
-    const content = data?.choices?.[0]?.message?.content;
-    out = Array.isArray(content) ? content.map((c) => c.text || '').join('') : String(content || '');
-  }
-  if (!out.trim()) throw new AiError('The AI returned an empty answer.', 502);
-  return out.trim();
-}
-
-// Models sometimes wrap JSON in code fences or add a sentence around it.
-function parseJsonAnswer(text) {
-  const cleaned = String(text).replace(/```(?:json)?/gi, '').trim();
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  if (start < 0 || end <= start) throw new AiError('The AI answer was not in the expected format.', 502);
-  try {
-    return JSON.parse(cleaned.slice(start, end + 1));
-  } catch {
-    throw new AiError('The AI answer was not in the expected format.', 502);
-  }
-}
-
-async function completeJson(opts) {
-  const text = await complete({ ...opts, temperature: opts.temperature ?? 0.2 });
-  return parseJsonAnswer(text);
-}
-
-module.exports = { AiError, apiKey, isConfigured, complete, completeJson, parseJsonAnswer };
+module.exports = router;
