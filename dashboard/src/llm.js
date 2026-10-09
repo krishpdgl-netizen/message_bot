@@ -14,6 +14,7 @@ class AiError extends Error {
 const DEFAULT_BASE = {
   anthropic: 'https://api.anthropic.com',
   openai: 'https://api.openai.com/v1',
+  gemini: 'https://generativelanguage.googleapis.com/v1beta/openai', // Gemini's OpenAI-compatible endpoint
 };
 
 // The key comes from the AI_API_KEY environment variable, or is saved from the dashboard.
@@ -39,7 +40,10 @@ async function complete({ system, text, images = [], maxTokens = 800, fast = fal
   const s = store.getSetting('ai');
   const { key } = apiKey();
   if (!isConfigured()) throw new AiError('AI is not set up yet. Add an API key in the AI tab.', 400);
-  const model = (fast && s.fastModel) || s.model;
+  // A fast model left over from another provider (e.g. claude-haiku while using Gemini) is ignored.
+  const family = { anthropic: /^claude/i, gemini: /^(models\/)?gemini/i }[s.provider];
+  const fastOk = s.fastModel && (!family || family.test(s.fastModel));
+  const model = (fast && fastOk && s.fastModel) || s.model;
   if (!model) throw new AiError('Choose an AI model in the AI tab.', 400);
   const base = (s.baseUrl || DEFAULT_BASE[s.provider] || DEFAULT_BASE.openai).replace(/\/+$/, '');
 
@@ -70,7 +74,8 @@ async function complete({ system, text, images = [], maxTokens = 800, fast = fal
     if (key) headers.authorization = `Bearer ${key}`;
     body = {
       model,
-      max_tokens: maxTokens,
+      // Gemini models think before answering and that counts against the output budget, so allow more room.
+      max_tokens: s.provider === 'gemini' ? maxTokens + 4000 : maxTokens,
       temperature,
       messages: [
         { role: 'system', content: system },
@@ -85,6 +90,7 @@ async function complete({ system, text, images = [], maxTokens = 800, fast = fal
         },
       ],
     };
+    if (s.provider === 'gemini') body.reasoning_effort = 'low'; // fast, cheap answers; enough for chat replies
   }
 
   let res;
@@ -101,8 +107,14 @@ async function complete({ system, text, images = [], maxTokens = 800, fast = fal
     data = null;
   }
   if (!res.ok) {
-    const msg = (data && data.error && (data.error.message || data.error)) || `HTTP ${res.status}`;
-    if (res.status === 401 || res.status === 403) throw new AiError('The AI provider rejected the API key.', 502);
+    // Gemini returns errors as [{ error: {...} }], the others as { error: {...} }.
+    const errObj = Array.isArray(data) ? data[0] && data[0].error : data && data.error;
+    const detail = (errObj && (errObj.message || (typeof errObj === 'string' ? errObj : ''))) || raw.slice(0, 200) || `HTTP ${res.status}`;
+    console.warn(`[ai] ${s.provider} ${model} -> HTTP ${res.status}: ${String(detail).slice(0, 300)}`);
+    if (res.status === 401 || res.status === 403) throw new AiError(`The AI provider rejected the API key: ${String(detail).slice(0, 200)}`, 502);
+    if (res.status === 404) throw new AiError(`Model "${model}" was not found at ${s.provider}. Check the model names in the Assistant tab. (${String(detail).slice(0, 150)})`, 502);
+    if (res.status === 429) throw new AiError(`AI quota or rate limit reached: ${String(detail).slice(0, 200)}`, 502);
+    const msg = detail;
     throw new AiError(`AI provider error: ${String(msg).slice(0, 300)}`, 502);
   }
 
