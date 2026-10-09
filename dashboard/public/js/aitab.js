@@ -12,6 +12,7 @@ const MODES = [
   ['auto', 'Auto-pilot', 'The AI answers on its own when it is confident, hands off to you when it is not, and drafts the rest.'],
 ];
 const PROVIDERS = {
+  gemini: { label: 'Google Gemini', models: ['gemini-3.6-flash'], url: 'https://generativelanguage.googleapis.com/v1beta/openai' },
   anthropic: { label: 'Anthropic (Claude)', models: ['claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5-5'], url: 'https://api.anthropic.com' },
   openai: { label: 'OpenAI or compatible (OpenRouter, Groq, Ollama...)', models: ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini'], url: 'https://api.openai.com/v1' },
 };
@@ -398,7 +399,7 @@ function settingsCard() {
       el('div', { class: 'span-all' }, el('span', { class: 'field-label', text: 'Mode' }), el('div', { class: 'seg seg-lg', role: 'group', 'aria-label': 'Agent mode' }, ...modeButtons), modeHint),
       el('h3', { class: 'form-section span-all', text: 'Provider' }),
       field('Provider', provider),
-      field('API URL (optional)', baseUrl, 'Leave empty for the default. For OpenRouter, Groq or Ollama use their OpenAI-compatible URL.'),
+      field('API URL (optional)', baseUrl, 'Leave empty for the default (also for Gemini). Only needed for OpenRouter, Groq or Ollama.'),
       field('Main model', el('span', {}, model, modelList), 'Used to decide and write replies to customers.'),
       field('Fast model', fastModel, 'Used for summaries and rewrites. Can be the same.'),
       el('div', { class: 'span-all' },
