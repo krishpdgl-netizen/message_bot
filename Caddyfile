@@ -1,0 +1,17 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	# OpenWA calls the webhook receiver directly inside the Docker network.
+	# Nothing on the internet needs it, so it is not exposed.
+	respond /webhooks/* 404
+
+	# Live updates (Server-Sent Events) must not be buffered.
+	reverse_proxy dashboard:3000 {
+		flush_interval -1
+	}
+}
