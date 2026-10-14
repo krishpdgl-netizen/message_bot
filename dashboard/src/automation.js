@@ -1,202 +1,164 @@
 'use strict';
 
-const express = require('express');
-const v = require('../validate');
-const store = require('../db');
-const { ruleMatches } = require('../automation');
-const { isOpen } = require('../schedule');
+// Rules, welcome message, away message, STOP / START opt-out, human takeover and the hand-over to the AI agent.
+const store = require('./db');
+const events = require('./events');
+const ai = require('./ai');
+const { isOpen } = require('./schedule');
+const { render, sendAndRecord } = require('./messaging');
 
 const { db } = store;
-const router = express.Router();
+const FOREVER = '9999-12-31T00:00:00.000Z';
+const HOUR = 3600 * 1000;
 
-const MATCH_TYPES = ['contains', 'exact', 'starts_with', 'regex', 'any'];
-const SCHEDULES = ['always', 'business_hours', 'after_hours'];
+const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
-function parseRule(body, partial = false) {
-  const out = {};
-  const has = (k) => !partial || k in body;
-
-  if (has('name')) out.name = v.text(body.name, { label: 'Name', max: 80 }).trim();
-  if (has('matchType')) out.match_type = v.oneOf(String(body.matchType), MATCH_TYPES, 'Match type');
-
-  const matchType = out.match_type ?? body.matchType;
-  if (has('pattern') || has('matchType')) {
-    if (matchType === 'any') out.pattern = '';
-    else if (matchType === 'regex') out.pattern = v.regexPattern(body.pattern);
-    else out.pattern = v.text(body.pattern, { label: 'Keywords', max: 500 }).trim();
+/**
+ * Does this rule answer this message? `rule` is a mapped rule (matchType, pattern).
+ * Keywords are comma separated and not case sensitive.
+ */
+function ruleMatches(rule, text) {
+  if (!rule) return false;
+  if (rule.matchType === 'any') return true;
+  const raw = String(text || '');
+  const pattern = String(rule.pattern || '');
+  if (!pattern) return false;
+  if (rule.matchType === 'regex') {
+    try {
+      return new RegExp(pattern, 'i').test(raw);
+    } catch {
+      return false;
+    }
   }
-  if (has('reply')) out.reply = v.text(body.reply, { label: 'Reply' });
-  if (has('enabled')) out.enabled = v.bool(body.enabled ?? true) ? 1 : 0;
-  if (has('sessionId')) out.session_id = body.sessionId ? v.uuid(body.sessionId, 'session id') : null;
-  if (has('priority')) out.priority = v.int(body.priority, { label: 'Priority', min: 0, max: 10000, fallback: 100 });
-  if (has('schedule')) out.schedule = v.oneOf(String(body.schedule || 'always'), SCHEDULES, 'Schedule');
-  if (has('cooldownMinutes')) {
-    out.cooldown_minutes = v.int(body.cooldownMinutes, { label: 'Cooldown', min: 0, max: 43200, fallback: 60 });
-  }
-  if (has('addTags')) out.add_tags = JSON.stringify(v.tags(body.addTags));
-  if (has('pauseBot')) out.pause_bot = v.bool(body.pauseBot) ? 1 : 0;
-  if (has('setStage')) out.set_stage = body.setStage ? v.oneOf(String(body.setStage), v.STAGES, 'Stage') : null;
-  return out;
+  const t = norm(raw);
+  const words = pattern.split(',').map(norm).filter(Boolean);
+  if (!words.length || !t) return false;
+  if (rule.matchType === 'exact') return words.some((w) => t === w);
+  if (rule.matchType === 'starts_with') return words.some((w) => t.startsWith(w));
+  return words.some((w) => t.includes(w)); // contains
 }
 
-const ruleOr404 = (id) => {
-  const row = db.prepare('SELECT * FROM rules WHERE id = ?').get(id);
-  if (!row) throw Object.assign(new v.ValidationError('Rule not found.'), { status: 404 });
-  return row;
-};
+const scheduleAllows = (schedule, open) => schedule === 'always' || (schedule === 'business_hours' ? open : !open);
 
-router.get('/rules', (req, res) => {
-  const rows = db.prepare('SELECT * FROM rules ORDER BY priority ASC, id ASC').all();
-  res.json({ items: rows.map(store.mapRule) });
-});
+function isPaused(contact) {
+  return Boolean(contact.botPausedUntil && contact.botPausedUntil > new Date().toISOString());
+}
 
-router.post('/rules', (req, res) => {
-  const r = parseRule(req.body || {});
-  const ts = store.now();
-  const info = db
-    .prepare(
-      `INSERT INTO rules (name, enabled, match_type, pattern, reply, session_id, priority, schedule, cooldown_minutes, add_tags, set_stage, pause_bot, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(r.name, r.enabled, r.match_type, r.pattern, r.reply, r.session_id, r.priority, r.schedule, r.cooldown_minutes, r.add_tags, r.set_stage, r.pause_bot, ts, ts);
-  res.status(201).json({ rule: store.mapRule(ruleOr404(Number(info.lastInsertRowid))) });
-});
+function autoRepliesLastHour(chatId) {
+  const since = new Date(Date.now() - HOUR).toISOString();
+  return db
+    .prepare("SELECT COUNT(*) AS n FROM messages WHERE chat_id = ? AND direction = 'out' AND source IN ('auto', 'ai') AND created_at >= ?")
+    .get(chatId, since).n;
+}
 
-router.patch('/rules/:id', (req, res) => {
-  const id = v.int(req.params.id, { label: 'id', min: 1 });
-  const current = store.mapRule(ruleOr404(id));
-  // Validate against the merged rule so pattern and match type stay consistent.
-  const merged = { ...current, ...(req.body || {}) };
-  const fields = parseRule(merged);
-  const keys = Object.keys(fields);
-  db.prepare(`UPDATE rules SET ${keys.map((k) => `${k} = ?`).join(', ')}, updated_at = ? WHERE id = ?`).run(
-    ...keys.map((k) => fields[k]),
-    store.now(),
-    id
+function sentRecently({ chatId, ruleId, body, hours, minutes }) {
+  const cutoff = new Date(Date.now() - (hours ? hours * HOUR : minutes * 60000)).toISOString();
+  if (ruleId) {
+    return Boolean(
+      db.prepare("SELECT 1 FROM messages WHERE chat_id = ? AND rule_id = ? AND direction = 'out' AND created_at > ? LIMIT 1").get(chatId, ruleId, cutoff)
+    );
+  }
+  return Boolean(
+    db.prepare("SELECT 1 FROM messages WHERE chat_id = ? AND source = 'auto' AND rule_id IS NULL AND direction = 'out' AND body = ? AND created_at > ? LIMIT 1").get(chatId, body, cutoff)
   );
-  res.json({ rule: store.mapRule(ruleOr404(id)) });
-});
+}
 
-router.delete('/rules/:id', (req, res) => {
-  const id = v.int(req.params.id, { label: 'id', min: 1 });
-  db.prepare('DELETE FROM rules WHERE id = ?').run(id);
-  res.json({ ok: true });
-});
+function pauseBot(chatId, minutes) {
+  const until = new Date(Date.now() + minutes * 60000).toISOString();
+  db.prepare('UPDATE contacts SET bot_paused_until = ? WHERE chat_id = ? AND (bot_paused_until IS NULL OR bot_paused_until != ?)').run(until, chatId, FOREVER);
+}
 
-// "Which rule would answer this message right now?"
-router.post('/rules/test', (req, res) => {
-  const body = v.text(req.body?.text, { label: 'Test message', max: 1000 });
+function applyRuleEffects(contact, rule) {
+  const chatId = contact.chatId;
+  if (rule.addTags && rule.addTags.length) {
+    const merged = [...new Set([...(contact.tags || []), ...rule.addTags])].slice(0, 20);
+    db.prepare('UPDATE contacts SET tags = ? WHERE chat_id = ?').run(JSON.stringify(merged), chatId);
+  }
+  if (rule.setStage) db.prepare('UPDATE contacts SET stage = ? WHERE chat_id = ?').run(rule.setStage, chatId);
+  if (rule.pauseBot) {
+    pauseBot(chatId, store.getSetting('humanTakeover').pauseMinutes || 60);
+    db.prepare("UPDATE contacts SET ai_flag = 'needs_human' WHERE chat_id = ?").run(chatId);
+  }
+  db.prepare('UPDATE rules SET hits = hits + 1 WHERE id = ?').run(rule.id);
+  events.publish('contact', { chatId });
+  if (rule.pauseBot) events.publish('ai', { chatId });
+}
+
+async function reply(sessionId, contact, text, extra = {}) {
+  if (!text || !String(text).trim()) return;
+  await sendAndRecord({ sessionId, chatId: contact.chatId, text: render(text, contact), source: 'auto', ...extra });
+}
+
+async function handle({ sessionId, contact, body, isNewContact }) {
+  const chatId = contact.chatId;
+  const text = String(body || '').trim();
+  const t = norm(text);
+
+  // 1. STOP / START always win.
+  const optOut = store.getSetting('optOut');
+  if (optOut.enabled && t) {
+    if ((optOut.keywords || []).includes(t) && !contact.optedOut) {
+      db.prepare('UPDATE contacts SET opted_out = 1 WHERE chat_id = ?').run(chatId);
+      events.publish('contact', { chatId });
+      await reply(sessionId, contact, optOut.reply);
+      return;
+    }
+    if ((optOut.optInKeywords || []).includes(t) && contact.optedOut) {
+      db.prepare('UPDATE contacts SET opted_out = 0 WHERE chat_id = ?').run(chatId);
+      events.publish('contact', { chatId });
+      await reply(sessionId, contact, optOut.optInReply);
+      return;
+    }
+  }
+  if (contact.optedOut) return;
+
+  // 2. A person is handling this chat, or the loop guard tripped.
+  if (isPaused(contact)) return;
+  const maxPerHour = store.getSetting('safety').maxAutoRepliesPerHour;
+  if (autoRepliesLastHour(chatId) >= maxPerHour) return;
+
   const open = isOpen();
-  const rules = db.prepare('SELECT * FROM rules WHERE enabled = 1 ORDER BY priority ASC, id ASC').all().map(store.mapRule);
-  const hit = rules.find(
-    (r) =>
-      (r.schedule === 'always' || (r.schedule === 'business_hours' ? open : !open)) && ruleMatches(r, body)
-  );
-  res.json({ open, rule: hit || null });
-});
 
-// ---------- Saved replies (quick replies in the inbox) ----------
-router.get('/saved-replies', (req, res) => {
-  res.json({ items: db.prepare('SELECT * FROM saved_replies ORDER BY title').all() });
-});
+  // 3. Keyword rules, first match by priority.
+  if (text) {
+    const rules = db.prepare('SELECT * FROM rules WHERE enabled = 1 ORDER BY priority ASC, id ASC').all().map(store.mapRule);
+    for (const rule of rules) {
+      if (rule.sessionId && rule.sessionId !== sessionId) continue;
+      if (!scheduleAllows(rule.schedule, open)) continue;
+      if (!ruleMatches(rule, text)) continue;
+      if (rule.cooldownMinutes > 0 && sentRecently({ chatId, ruleId: rule.id, minutes: rule.cooldownMinutes })) continue;
+      await reply(sessionId, contact, rule.reply, { ruleId: rule.id });
+      applyRuleEffects(store.getContact(chatId) || contact, rule);
+      return;
+    }
+  }
 
-router.post('/saved-replies', (req, res) => {
-  const title = v.text(req.body?.title, { label: 'Title', max: 60 }).trim();
-  const body = v.text(req.body?.body, { label: 'Reply text' });
-  const info = db.prepare('INSERT INTO saved_replies (title, body, created_at) VALUES (?, ?, ?)').run(title, body, store.now());
-  res.status(201).json({ item: db.prepare('SELECT * FROM saved_replies WHERE id = ?').get(Number(info.lastInsertRowid)) });
-});
+  // 4. Away message when closed (also while the AI drafts).
+  let answered = false;
+  const away = store.getSetting('away');
+  if (!open && away.enabled && away.text && !sentRecently({ chatId, body: render(away.text, contact), hours: away.cooldownHours || 12 })) {
+    await reply(sessionId, contact, away.text);
+    answered = true;
+  }
 
-router.delete('/saved-replies/:id', (req, res) => {
-  db.prepare('DELETE FROM saved_replies WHERE id = ?').run(v.int(req.params.id, { label: 'id', min: 1 }));
-  res.json({ ok: true });
-});
+  // 5. AI agent.
+  if (ai.isActive()) {
+    ai.queueInbound(sessionId, chatId);
+    return;
+  }
 
-// ---------- Settings ----------
-const keywordList = (value, label) => {
-  const list = (Array.isArray(value) ? value : String(value || '').split(','))
-    .map((s) => String(s).trim().toLowerCase())
-    .filter(Boolean);
-  if (list.length > 20) throw new v.ValidationError(`${label}: at most 20 keywords.`);
-  list.forEach((k) => {
-    if (k.length > 30) throw new v.ValidationError(`${label}: keywords must be 30 characters or less.`);
-  });
-  return list;
-};
+  // 6. Welcome for brand new contacts.
+  const welcome = store.getSetting('welcome');
+  if (!answered && isNewContact && welcome.enabled && welcome.text) await reply(sessionId, contact, welcome.text);
+}
 
-const SETTING_PARSERS = {
-  businessHours: (b) => {
-    const days = (Array.isArray(b.days) ? b.days : []).map((d) => v.int(d, { label: 'Day', min: 0, max: 6 }));
-    return {
-      enabled: v.bool(b.enabled),
-      timezone: v.timezone(b.timezone),
-      days: [...new Set(days)].sort(),
-      start: v.hhmm(b.start, 'Opening time'),
-      end: v.hhmm(b.end, 'Closing time'),
-    };
-  },
-  welcome: (b) => ({ enabled: v.bool(b.enabled), text: v.optionalText(b.text, { label: 'Welcome message' }) }),
-  away: (b) => ({
-    enabled: v.bool(b.enabled),
-    text: v.optionalText(b.text, { label: 'Away message' }),
-    cooldownHours: v.int(b.cooldownHours, { label: 'Away cooldown', min: 1, max: 168, fallback: 12 }),
-  }),
-  optOut: (b) => ({
-    enabled: v.bool(b.enabled),
-    keywords: keywordList(b.keywords, 'Opt-out keywords'),
-    optInKeywords: keywordList(b.optInKeywords, 'Opt-in keywords'),
-    reply: v.optionalText(b.reply, { label: 'Opt-out reply' }),
-    optInReply: v.optionalText(b.optInReply, { label: 'Opt-in reply' }),
-  }),
-  humanTakeover: (b) => ({
-    pauseMinutes: v.int(b.pauseMinutes, { label: 'Pause after manual reply', min: 0, max: 10080, fallback: 60 }),
-  }),
-  safety: (b) => ({
-    maxAutoRepliesPerHour: v.int(b.maxAutoRepliesPerHour, { label: 'Max auto-replies per hour', min: 1, max: 50, fallback: 5 }),
-  }),
-  campaigns: (b) => {
-    const minDelay = v.int(b.minDelay, { label: 'Minimum delay', min: 3, max: 3600, fallback: 8 });
-    const maxDelay = v.int(b.maxDelay, { label: 'Maximum delay', min: 3, max: 3600, fallback: 20 });
-    if (maxDelay < minDelay) throw new v.ValidationError('Maximum delay must be at least the minimum delay.');
-    return { dailyCap: v.int(b.dailyCap, { label: 'Daily cap', min: 0, max: 10000, fallback: 200 }), minDelay, maxDelay };
-  },
-};
+async function handleInbound(args) {
+  if (!args || !args.contact) return;
+  try {
+    await handle(args);
+  } catch (err) {
+    console.warn(`[automation] ${args.contact.chatId}: ${err.message}`);
+  }
+}
 
-SETTING_PARSERS.ai = (b) => {
-  const provider = v.oneOf(String(b.provider || 'gemini'), ['gemini', 'anthropic', 'openai'], 'Provider');
-  const baseUrl = v.optionalText(b.baseUrl, { label: 'API URL', max: 300 }).trim();
-  if (baseUrl && !/^https?:\/\/[^\s]+$/i.test(baseUrl)) throw new v.ValidationError('API URL must start with http:// or https://');
-  const conf = Number(b.minConfidence);
-  return {
-    mode: v.oneOf(String(b.mode || 'off'), ['off', 'suggest', 'auto'], 'Mode'),
-    provider,
-    model: v.text(b.model, { label: 'Model', max: 100 }).trim(),
-    fastModel: v.optionalText(b.fastModel, { label: 'Fast model', max: 100 }).trim(),
-    baseUrl,
-    businessName: v.optionalText(b.businessName, { label: 'Business name', max: 100 }).trim(),
-    instructions: v.optionalText(b.instructions, { label: 'Instructions', max: 4000 }),
-    knowledge: v.optionalText(b.knowledge, { label: 'Knowledge base', max: 30000 }),
-    schedule: v.oneOf(String(b.schedule || 'always'), SCHEDULES, 'Schedule'),
-    replyDelaySeconds: v.int(b.replyDelaySeconds, { label: 'Reply delay', min: 0, max: 120, fallback: 8 }),
-    minConfidence: Number.isFinite(conf) ? Math.max(0, Math.min(1, conf)) : 0.7,
-    handoffMessage: v.optionalText(b.handoffMessage, { label: 'Hand-off message', max: 1000 }),
-    autoUpdateLead: v.bool(b.autoUpdateLead),
-    vision: v.bool(b.vision),
-    autoSummary: v.bool(b.autoSummary),
-    contextMessages: v.int(b.contextMessages, { label: 'Messages of context', min: 5, max: 80, fallback: 30 }),
-  };
-};
-
-router.get('/settings', (req, res) => {
-  res.json({ settings: store.getAllSettings(), open: isOpen() });
-});
-
-router.put('/settings/:key', (req, res) => {
-  const parse = SETTING_PARSERS[req.params.key];
-  if (!parse) throw Object.assign(new v.ValidationError('Unknown setting.'), { status: 404 });
-  const value = parse(req.body || {});
-  store.setSetting(req.params.key, value);
-  res.json({ key: req.params.key, value: store.getSetting(req.params.key), open: isOpen() });
-});
-
-module.exports = router;
+module.exports = { ruleMatches, handleInbound };
