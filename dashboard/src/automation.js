@@ -163,7 +163,7 @@ const SETTING_PARSERS = {
 };
 
 SETTING_PARSERS.ai = (b) => {
-  const provider = v.oneOf(String(b.provider || 'anthropic'), ['anthropic', 'openai', 'gemini'], 'Provider');
+  const provider = v.oneOf(String(b.provider || 'gemini'), ['gemini', 'anthropic', 'openai'], 'Provider');
   const baseUrl = v.optionalText(b.baseUrl, { label: 'API URL', max: 300 }).trim();
   if (baseUrl && !/^https?:\/\/[^\s]+$/i.test(baseUrl)) throw new v.ValidationError('API URL must start with http:// or https://');
   const conf = Number(b.minConfidence);
