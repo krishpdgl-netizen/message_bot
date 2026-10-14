@@ -85,7 +85,12 @@ router.post('/campaigns', (req, res) => {
   const defaults = store.getSetting('campaigns');
   const name = v.text(body.name, { label: 'Campaign name', max: 80 }).trim();
   const sessionId = v.uuid(body.sessionId, 'session id');
-  const message = v.text(body.message);
+  const libraryId = body.libraryId ? v.int(body.libraryId, { label: 'Attachment', min: 1 }) : null;
+  if (libraryId && !db.prepare('SELECT 1 FROM library WHERE id = ?').get(libraryId)) {
+    throw new v.ValidationError('The attached file was not found in the media library.');
+  }
+  // With a file attached the text is optional (it becomes the caption).
+  const message = libraryId ? v.optionalText(body.message) : v.text(body.message);
   const minDelay = v.int(body.minDelay, { label: 'Minimum delay', min: 3, max: 3600, fallback: defaults.minDelay });
   const maxDelay = v.int(body.maxDelay, { label: 'Maximum delay', min: 3, max: 3600, fallback: defaults.maxDelay });
   if (maxDelay < minDelay) throw new v.ValidationError('Maximum delay must be at least the minimum delay.');
@@ -100,8 +105,8 @@ router.post('/campaigns', (req, res) => {
     const info = db
       .prepare(
         `INSERT INTO campaigns (name, session_id, message, status, scheduled_at, min_delay, max_delay,
-           business_hours_only, skip_unregistered, total, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           business_hours_only, skip_unregistered, total, created_at, library_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         name,
@@ -114,7 +119,8 @@ router.post('/campaigns', (req, res) => {
         v.bool(body.businessHoursOnly) ? 1 : 0,
         body.skipUnregistered === undefined || v.bool(body.skipUnregistered) ? 1 : 0,
         recipients.size,
-        ts
+        ts,
+        libraryId
       );
     const campaignId = Number(info.lastInsertRowid);
     const insert = db.prepare('INSERT INTO campaign_recipients (campaign_id, chat_id, phone, name) VALUES (?, ?, ?, ?)');
