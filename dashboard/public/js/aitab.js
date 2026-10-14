@@ -12,7 +12,7 @@ const MODES = [
   ['auto', 'Auto-pilot', 'The AI answers on its own when it is confident, hands off to you when it is not, and drafts the rest.'],
 ];
 const PROVIDERS = {
-  gemini: { label: 'Google Gemini', models: ['gemini-3.6-flash'], url: 'https://generativelanguage.googleapis.com/v1beta/openai' },
+  gemini: { label: 'Google Gemini', models: ['gemini-3.1-flash-lite'], url: 'https://generativelanguage.googleapis.com/v1beta/openai' },
   anthropic: { label: 'Anthropic (Claude)', models: ['claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5-5'], url: 'https://api.anthropic.com' },
   openai: { label: 'OpenAI or compatible (OpenRouter, Groq, Ollama...)', models: ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini'], url: 'https://api.openai.com/v1' },
 };
