@@ -185,6 +185,7 @@ addColumn('contacts', 'ai_intent', 'TEXT');
 addColumn('contacts', 'ai_sentiment', 'TEXT');
 addColumn('contacts', 'ai_flag', 'TEXT'); // needs_human | hot | unhappy
 addColumn('contacts', 'ai_updated_at', 'TEXT');
+addColumn('campaigns', 'library_id', 'INTEGER'); // optional file from the media library sent with the message
 
 const now = () => new Date().toISOString();
 
@@ -406,7 +407,14 @@ function mapCampaign(row) {
     createdAt: row.created_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
+    libraryId: row.library_id || null,
+    attachment: row.library_id ? campaignAttachment(row.library_id) : null,
   };
+}
+
+function campaignAttachment(id) {
+  const item = db.prepare('SELECT id, title, filename, mime, size FROM library WHERE id = ?').get(id);
+  return item ? { id: item.id, title: item.title, filename: item.filename, mime: item.mime, size: item.size } : { id, missing: true };
 }
 
 // ---------- Contacts ----------
