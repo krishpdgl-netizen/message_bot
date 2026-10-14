@@ -3,7 +3,8 @@
 const store = require('./db');
 const events = require('./events');
 const { isOpen } = require('./schedule');
-const { render, sendAndRecord } = require('./messaging');
+const { render, sendAndRecord, sendMediaAndRecord } = require('./messaging');
+const media = require('./media');
 const openwa = require('./openwa');
 
 const { db } = store;
@@ -44,6 +45,27 @@ function finishRecipient(campaign, recipient, outcome, extra = {}) {
   });
 }
 
+// Sends the campaign message to one person, with the attached library file if there is one.
+async function sendToRecipient(campaign, recipient, attachment) {
+  const text = render(campaign.message, store.getContact(recipient.chat_id));
+  const base = { sessionId: campaign.session_id, chatId: recipient.chat_id, source: 'campaign', campaignId: campaign.id };
+  if (!attachment) return sendAndRecord({ ...base, text });
+
+  // The message goes as the caption when it fits; otherwise (audio, or longer than 1024) it follows as a text.
+  const kind = media.kindFromMime(attachment.item.mime);
+  const asCaption = Boolean(text.trim()) && kind !== 'audio' && text.length <= 1024;
+  const sent = await sendMediaAndRecord({
+    ...base,
+    buffer: attachment.buffer,
+    mime: attachment.item.mime,
+    filename: attachment.item.filename,
+    caption: asCaption ? text : '',
+    storedPath: attachment.item.path,
+  });
+  if (text.trim() && !asCaption) await sendAndRecord({ ...base, text });
+  return sent;
+}
+
 async function processCampaign(campaign) {
   const ts = store.now();
   if (campaign.next_send_at && campaign.next_send_at > ts) return;
@@ -74,6 +96,19 @@ async function processCampaign(campaign) {
     setCampaign(campaign.id, { status: 'completed', finished_at: ts, next_send_at: null, last_error: null });
     events.publish('campaign', { id: campaign.id });
     return;
+  }
+
+  // Load the attached file once per send; pause the campaign if it was removed from the library.
+  let attachment = null;
+  if (campaign.library_id) {
+    const item = db.prepare('SELECT * FROM library WHERE id = ?').get(campaign.library_id);
+    const buffer = item && media.readBuffer(item.path);
+    if (!buffer) {
+      setCampaign(campaign.id, { status: 'paused', last_error: 'The attached file is no longer in the media library. Campaign paused.' });
+      events.publish('campaign', { id: campaign.id });
+      return;
+    }
+    attachment = { item, buffer };
   }
 
   const contact = store.getContact(recipient.chat_id);
@@ -107,13 +142,7 @@ async function processCampaign(campaign) {
 
   const delay = randomBetween(campaign.min_delay, campaign.max_delay);
   try {
-    const { messageId } = await sendAndRecord({
-      sessionId: campaign.session_id,
-      chatId: recipient.chat_id,
-      text: render(campaign.message, store.getContact(recipient.chat_id)),
-      source: 'campaign',
-      campaignId: campaign.id,
-    });
+    const { messageId } = await sendToRecipient(campaign, recipient, attachment);
     finishRecipient(campaign, recipient, 'sent', { waId: messageId });
     setCampaign(campaign.id, { next_send_at: later(delay), last_error: null });
     sessionNextAt.set(campaign.session_id, later(delay));
