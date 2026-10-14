@@ -3,13 +3,14 @@
 const store = require('./db');
 const events = require('./events');
 const { isOpen } = require('./schedule');
-const { render, sendAndRecord } = require('./messaging');
+const { render, sendAndRecord, sendMediaAndRecord } = require('./messaging');
+const media = require('./media');
 const openwa = require('./openwa');
 
 const { db } = store;
 const TICK_MS = 3000;
 const MAX_ATTEMPTS = 3;
-const sessionNextAt = new Map(); // keeps campaigns on one number from sending in parallel
+const sessionNextAt = new Map();
 let running = false;
 
 const later = (seconds) => new Date(Date.now() + seconds * 1000).toISOString();
@@ -71,7 +72,12 @@ async function processCampaign(campaign) {
     .get(campaign.id);
 
   if (!recipient) {
-    setCampaign(campaign.id, { status: 'completed', finished_at: ts, next_send_at: null, last_error: null });
+    setCampaign(campaign.id, {
+      status: 'completed',
+      finished_at: ts,
+      next_send_at: null,
+      last_error: null
+    });
     events.publish('campaign', { id: campaign.id });
     return;
   }
@@ -80,7 +86,7 @@ async function processCampaign(campaign) {
   if (contact && contact.optedOut) {
     finishRecipient(campaign, recipient, 'skipped', { error: 'Opted out' });
     events.publish('campaign', { id: campaign.id });
-    return; // no delay needed, nothing was sent
+    return;
   }
 
   if (campaign.skip_unregistered) {
@@ -106,47 +112,115 @@ async function processCampaign(campaign) {
   });
 
   const delay = randomBetween(campaign.min_delay, campaign.max_delay);
+
   try {
-    const { messageId } = await sendAndRecord({
-      sessionId: campaign.session_id,
-      chatId: recipient.chat_id,
-      text: render(campaign.message, store.getContact(recipient.chat_id)),
-      source: 'campaign',
-      campaignId: campaign.id,
-    });
-    finishRecipient(campaign, recipient, 'sent', { waId: messageId });
-    setCampaign(campaign.id, { next_send_at: later(delay), last_error: null });
-    sessionNextAt.set(campaign.session_id, later(delay));
-  } catch (err) {
-    const transient = err.status === 0 || err.status === 409 || err.status >= 500 || err.status === 429;
-    if (transient && recipient.attempts + 1 < MAX_ATTEMPTS) {
-      db.prepare('UPDATE campaign_recipients SET attempts = attempts + 1, error = ? WHERE id = ?').run(err.message, recipient.id);
-      setCampaign(campaign.id, { next_send_at: later(30), last_error: `Retrying soon: ${err.message}` });
+    const renderedMessage = render(
+      campaign.message,
+      store.getContact(recipient.chat_id)
+    );
+
+    let messageId;
+
+    if (campaign.media_path) {
+      const buffer = await media.readBuffer(campaign.media_path);
+
+      const result = await sendMediaAndRecord({
+        sessionId: campaign.session_id,
+        chatId: recipient.chat_id,
+        buffer,
+        mime: campaign.media_mime,
+        filename: campaign.media_name,
+        caption: renderedMessage,
+        source: 'campaign',
+        campaignId: campaign.id,
+      });
+
+      messageId = result.messageId;
     } else {
-      finishRecipient(campaign, recipient, 'failed', { error: err.message });
-      setCampaign(campaign.id, { next_send_at: later(delay), last_error: err.message });
+      const result = await sendAndRecord({
+        sessionId: campaign.session_id,
+        chatId: recipient.chat_id,
+        text: renderedMessage,
+        source: 'campaign',
+        campaignId: campaign.id,
+      });
+
+      messageId = result.messageId;
+    }
+
+    finishRecipient(campaign, recipient, 'sent', { waId: messageId });
+    setCampaign(campaign.id, {
+      next_send_at: later(delay),
+      last_error: null
+    });
+    sessionNextAt.set(campaign.session_id, later(delay));
+
+  } catch (err) {
+    const transient =
+      err.status === 0 ||
+      err.status === 409 ||
+      err.status >= 500 ||
+      err.status === 429;
+
+    if (transient && recipient.attempts + 1 < MAX_ATTEMPTS) {
+      db.prepare(
+        'UPDATE campaign_recipients SET attempts = attempts + 1, error = ? WHERE id = ?'
+      ).run(err.message, recipient.id);
+
+      setCampaign(campaign.id, {
+        next_send_at: later(30),
+        last_error: `Retrying soon: ${err.message}`
+      });
+
+    } else {
+      finishRecipient(campaign, recipient, 'failed', {
+        error: err.message
+      });
+
+      setCampaign(campaign.id, {
+        next_send_at: later(delay),
+        last_error: err.message
+      });
     }
   }
+
   events.publish('campaign', { id: campaign.id });
 }
 
 async function tick() {
   if (running) return;
   running = true;
+
   try {
     const ts = store.now();
+
     const due = db
-      .prepare("SELECT id FROM campaigns WHERE status = 'scheduled' AND (scheduled_at IS NULL OR scheduled_at <= ?)")
+      .prepare(
+        "SELECT id FROM campaigns WHERE status = 'scheduled' AND (scheduled_at IS NULL OR scheduled_at <= ?)"
+      )
       .all(ts);
+
     for (const { id } of due) {
-      setCampaign(id, { status: 'running', started_at: ts, next_send_at: ts });
+      setCampaign(id, {
+        status: 'running',
+        started_at: ts,
+        next_send_at: ts
+      });
+
       events.publish('campaign', { id });
     }
 
-    const active = db.prepare("SELECT * FROM campaigns WHERE status = 'running' ORDER BY id").all();
-    for (const campaign of active) await processCampaign(campaign);
+    const active = db
+      .prepare("SELECT * FROM campaigns WHERE status = 'running' ORDER BY id")
+      .all();
+
+    for (const campaign of active) {
+      await processCampaign(campaign);
+    }
+
   } catch (err) {
     console.error(`[campaigns] worker error: ${err.message}`);
+
   } finally {
     running = false;
   }
