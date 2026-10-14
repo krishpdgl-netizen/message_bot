@@ -57,16 +57,17 @@ const TYPE_FOR_KIND = { image: 'image', video: 'video', audio: 'audio', document
  * Sends a file (photo, video, audio, document) with an optional caption and records it in the inbox.
  * The file is kept on the data volume so the thread can show it.
  */
-async function sendMediaAndRecord({ sessionId, chatId, buffer, mime, filename, caption, source, ruleId, campaignId }) {
+// storedPath: reuse a file already on disk (e.g. a library item for a campaign) instead of saving a new copy.
+async function sendMediaAndRecord({ sessionId, chatId, buffer, mime, filename, caption, source, ruleId, campaignId, storedPath }) {
   const mimetype = media.cleanMime(mime);
   const kind = media.kindFromMime(mimetype);
   const name = media.safeFilename(filename, mimetype);
-  const stored = media.saveBuffer(buffer, mimetype);
+  const stored = storedPath ? { path: storedPath, size: buffer.length } : media.saveBuffer(buffer, mimetype);
   let messageId;
   try {
     ({ messageId } = await openwa.sendMedia(sessionId, chatId, kind, { buffer, mimetype, filename: name, caption }));
   } catch (err) {
-    media.remove(stored.path);
+    if (!storedPath) media.remove(stored.path);
     throw err;
   }
   store.upsertContact({ chatId, sessionId, phone: phoneFromChatId(chatId), source: 'outbound' });
