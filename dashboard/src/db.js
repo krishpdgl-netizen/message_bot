@@ -239,9 +239,9 @@ const DEFAULT_SETTINGS = {
   ai: {
     // off: AI never writes to customers. suggest: drafts replies for you to approve. auto: sends on its own.
     mode: 'off',
-    provider: 'anthropic', // anthropic | openai (any OpenAI-compatible API)
-    model: 'claude-sonnet-5-5',
-    fastModel: 'claude-haiku-5-5', // summaries, scoring, rewrites
+    provider: 'gemini', // gemini | anthropic | openai (any OpenAI-compatible API)
+    model: 'gemini-3.1-flash-lite',
+    fastModel: 'gemini-3.1-flash-lite', // summaries, scoring, rewrites
     baseUrl: '',
     businessName: '',
     instructions:
